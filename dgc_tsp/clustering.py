@@ -1,218 +1,233 @@
 """
-Deep Graph Clustering Module for TSP
+E(2)-Equivariant Graph Clustering for TSP
 
-This module learns to partition TSP graphs in a way that:
-1. Minimizes inter-cluster edges in the optimal tour
-2. Creates balanced clusters for parallel processing
-3. Adapts to problem structure
+This module learns to partition TSP graphs using EGNN-based clustering.
+The clustering is E(2)-invariant (rotation/translation invariant).
+
+Key features:
+1. EGNN encoder produces invariant node embeddings
+2. Soft cluster assignment via attention to learnable centroids
+3. Tour-aware self-supervised loss to minimize inter-cluster tour edges
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, Dict
+from typing import Optional, Dict, List
 import numpy as np
 
+from .encoder import EGNNEncoder
 
-class SoftClusterAssignment(nn.Module):
+
+class EGNNClusteringNetwork(nn.Module):
     """
-    Soft cluster assignment using attention mechanism.
+    E(2)-Equivariant Clustering Network for TSP.
 
-    Produces differentiable soft assignments that can be used
-    for end-to-end training with tour-aware losses.
+    Uses EGNN to produce invariant node embeddings, then assigns
+    nodes to clusters in a way that minimizes tour edge cuts.
     """
 
     def __init__(
         self,
-        input_dim: int = 128,
-        hidden_dim: int = 128,
         num_clusters: int = 10,
-        temperature: float = 1.0,
+        hidden_dim: int = 128,
+        num_egnn_layers: int = 4,
+        temperature: float = 0.5,
+        lambda_balance: float = 0.1,
+        lambda_tour: float = 1.0,
+        lambda_contrastive: float = 0.1,
     ):
+        """
+        Args:
+            num_clusters: Number of clusters (k)
+            hidden_dim: Hidden dimension for EGNN and MLP
+            num_egnn_layers: Number of EGNN layers
+            temperature: Temperature for cluster assignment softmax
+            lambda_balance: Weight for balance loss
+            lambda_tour: Weight for tour alignment loss
+            lambda_contrastive: Weight for contrastive loss
+        """
         super().__init__()
         self.num_clusters = num_clusters
+        self.hidden_dim = hidden_dim
         self.temperature = temperature
+        self.lambda_balance = lambda_balance
+        self.lambda_tour = lambda_tour
+        self.lambda_contrastive = lambda_contrastive
+
+        # EGNN encoder: produces E(2)-invariant node embeddings
+        self.encoder = EGNNEncoder(
+            input_dim=2,
+            hidden_dim=hidden_dim,
+            output_dim=hidden_dim,
+            num_layers=num_egnn_layers,
+        )
 
         # Learnable cluster centroids in embedding space
         self.cluster_centroids = nn.Parameter(
-            torch.randn(num_clusters, input_dim) * 0.1
+            torch.randn(num_clusters, hidden_dim) * 0.1
         )
 
-        # MLP for transforming node embeddings before assignment
-        self.transform = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+        # MLP for cluster assignment
+        self.assignment_mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim, input_dim),
+            nn.Linear(hidden_dim, hidden_dim),
         )
 
-        # Attention-based assignment
-        self.query_proj = nn.Linear(input_dim, input_dim)
-        self.key_proj = nn.Linear(input_dim, input_dim)
+        # Projection head for contrastive learning
+        self.projection_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
 
-    def forward(
+    def encode(self, coords: torch.Tensor) -> torch.Tensor:
+        """
+        Encode coordinates to E(2)-invariant node embeddings.
+
+        Args:
+            coords: Node coordinates (batch, n, 2)
+
+        Returns:
+            Node embeddings (batch, n, hidden_dim)
+        """
+        return self.encoder(coords)
+
+    def get_assignments(
         self,
         h: torch.Tensor,
         hard: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """
-        Compute cluster assignments.
+        Get cluster assignments from node embeddings.
 
         Args:
-            h: Node embeddings (batch_size, n, input_dim)
-            hard: If True, return hard assignments (argmax)
+            h: Node embeddings (batch, n, hidden_dim)
+            hard: If True, return one-hot assignments
 
         Returns:
-            assignments: Soft assignments (batch_size, n, num_clusters)
-            cluster_centroids: Current cluster centroids
+            Soft or hard cluster assignments (batch, n, k)
         """
         batch_size, n, d = h.shape
 
         # Transform embeddings
-        h_transformed = self.transform(h)
+        h_transformed = self.assignment_mlp(h)  # (batch, n, d)
 
-        # Compute attention scores to cluster centroids
-        queries = self.query_proj(h_transformed)  # (batch, n, d)
-        keys = self.key_proj(self.cluster_centroids.unsqueeze(0).expand(batch_size, -1, -1))  # (batch, k, d)
+        # Compute similarity to cluster centroids
+        # centroids: (k, d) -> (1, k, d) -> (batch, k, d)
+        centroids = self.cluster_centroids.unsqueeze(0).expand(batch_size, -1, -1)
 
-        # Attention: (batch, n, d) @ (batch, d, k) -> (batch, n, k)
-        scores = torch.bmm(queries, keys.transpose(1, 2)) / (d ** 0.5)
+        # Dot product similarity: (batch, n, d) @ (batch, d, k) -> (batch, n, k)
+        scores = torch.bmm(h_transformed, centroids.transpose(1, 2))
+        scores = scores / (d ** 0.5)  # Scale by sqrt(d)
         scores = scores / self.temperature
 
         # Soft assignment via softmax
         assignments = F.softmax(scores, dim=-1)
 
         if hard:
-            # Straight-through estimator for hard assignments
+            # Straight-through estimator
             hard_assignments = F.one_hot(assignments.argmax(dim=-1), self.num_clusters).float()
             assignments = hard_assignments - assignments.detach() + assignments
 
-        return assignments, self.cluster_centroids
-
-
-class DeepGraphClustering(nn.Module):
-    """
-    Deep Graph Clustering for TSP.
-
-    Combines representation learning with clustering in a way
-    that aligns with optimal tour structure.
-    """
-
-    def __init__(
-        self,
-        input_dim: int = 128,
-        hidden_dim: int = 128,
-        num_clusters: int = 10,
-        temperature: float = 0.5,
-        lambda_balance: float = 0.1,
-        lambda_tour: float = 1.0,
-    ):
-        super().__init__()
-        self.num_clusters = num_clusters
-        self.lambda_balance = lambda_balance
-        self.lambda_tour = lambda_tour
-
-        # Soft cluster assignment module
-        self.cluster_assignment = SoftClusterAssignment(
-            input_dim=input_dim,
-            hidden_dim=hidden_dim,
-            num_clusters=num_clusters,
-            temperature=temperature,
-        )
-
-        # Projection head for contrastive learning
-        self.projection_head = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-
-        # L2 normalization for contrastive learning
-        self.l2_norm = lambda x: F.normalize(x, p=2, dim=-1)
+        return assignments
 
     def forward(
         self,
-        h: torch.Tensor,
+        coords: torch.Tensor,
         hard: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass.
 
         Args:
-            h: Node embeddings from encoder (batch_size, n, input_dim)
+            coords: Node coordinates (batch, n, 2)
             hard: Whether to use hard cluster assignments
 
         Returns:
-            Dictionary containing:
-                - assignments: Cluster assignments (batch, n, k)
-                - projections: Projected embeddings for contrastive loss
-                - centroids: Cluster centroids
+            Dictionary with embeddings, assignments, projections
         """
+        # Encode to invariant embeddings
+        h = self.encode(coords)
+
         # Get cluster assignments
-        assignments, centroids = self.cluster_assignment(h, hard=hard)
+        assignments = self.get_assignments(h, hard=hard)
 
         # Project for contrastive learning
         projections = self.projection_head(h)
-        projections = self.l2_norm(projections)
+        projections = F.normalize(projections, p=2, dim=-1)
 
         return {
+            'embeddings': h,
             'assignments': assignments,
             'projections': projections,
-            'centroids': centroids,
         }
 
-    def contrastive_loss(
+    def tour_alignment_loss(
         self,
-        projections: torch.Tensor,
         assignments: torch.Tensor,
-        temperature: float = 0.1,
+        tour: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Compute contrastive loss (InfoNCE-style).
+        Compute tour alignment loss (vectorized, no loops).
 
-        Nodes in the same cluster should have similar embeddings.
+        Encourages adjacent nodes in tour to be in the same cluster.
 
         Args:
-            projections: L2-normalized projections (batch, n, d)
             assignments: Soft cluster assignments (batch, n, k)
-            temperature: Temperature for contrastive loss
+            tour: Tour indices (batch, n)
 
         Returns:
-            Contrastive loss scalar
+            Loss scalar
         """
-        batch_size, n, d = projections.shape
+        batch_size, n, k = assignments.shape
+        device = assignments.device
 
-        # Compute similarity matrix
-        sim_matrix = torch.bmm(projections, projections.transpose(1, 2))  # (batch, n, n)
-        sim_matrix = sim_matrix / temperature
+        # Get assignments for each position in tour
+        # tour[b, i] gives the node index at position i
+        # We want to compare assignment of tour[b, i] with tour[b, i+1]
 
-        # Compute cluster membership similarity (how likely two nodes are in same cluster)
-        cluster_sim = torch.bmm(assignments, assignments.transpose(1, 2))  # (batch, n, n)
+        # Gather assignments according to tour order
+        # assignments: (batch, n, k), tour: (batch, n)
+        tour_expanded = tour.unsqueeze(-1).expand(-1, -1, k)  # (batch, n, k)
+        ordered_assignments = torch.gather(assignments, 1, tour_expanded)  # (batch, n, k)
 
-        # Mask diagonal
-        mask = torch.eye(n, device=projections.device).unsqueeze(0).expand(batch_size, -1, -1)
-        sim_matrix = sim_matrix - mask * 1e9
+        # Compare adjacent positions in tour
+        # Current position assignments
+        curr_assign = ordered_assignments[:, :-1, :]  # (batch, n-1, k)
+        # Next position assignments
+        next_assign = ordered_assignments[:, 1:, :]  # (batch, n-1, k)
 
-        # InfoNCE loss: similar cluster members should have high similarity
-        # Use cluster_sim as soft positive weights
-        exp_sim = torch.exp(sim_matrix)
-        positive_sim = (exp_sim * cluster_sim).sum(dim=-1)
-        negative_sim = exp_sim.sum(dim=-1)
+        # Also compare last with first (tour is cyclic)
+        last_assign = ordered_assignments[:, -1:, :]  # (batch, 1, k)
+        first_assign = ordered_assignments[:, :1, :]  # (batch, 1, k)
 
-        loss = -torch.log(positive_sim / (negative_sim + 1e-8) + 1e-8)
-        return loss.mean()
+        # Concatenate
+        curr_assign = torch.cat([curr_assign, last_assign], dim=1)  # (batch, n, k)
+        next_assign = torch.cat([next_assign, first_assign], dim=1)  # (batch, n, k)
+
+        # Compute probability that adjacent nodes are in same cluster
+        # sum_k(p_i[k] * p_j[k]) = probability of same cluster
+        same_cluster_prob = (curr_assign * next_assign).sum(dim=-1)  # (batch, n)
+
+        # Loss: maximize same_cluster_prob -> minimize (1 - same_cluster_prob)
+        loss = (1 - same_cluster_prob).mean()
+
+        return loss
 
     def balance_loss(self, assignments: torch.Tensor) -> torch.Tensor:
         """
-        Compute balance loss to ensure roughly equal cluster sizes.
+        Compute balance loss for equal-sized clusters.
 
         Args:
             assignments: Soft cluster assignments (batch, n, k)
 
         Returns:
-            Balance loss scalar
+            Loss scalar
         """
-        # Average assignment per cluster
-        cluster_sizes = assignments.mean(dim=1)  # (batch, k)
+        # Average assignment per cluster: (batch, k)
+        cluster_sizes = assignments.mean(dim=1)
 
         # Target: uniform distribution
         target = torch.ones_like(cluster_sizes) / self.num_clusters
@@ -225,110 +240,110 @@ class DeepGraphClustering(nn.Module):
         )
         return loss
 
-    def tour_alignment_loss(
+    def contrastive_loss(
         self,
+        projections: torch.Tensor,
         assignments: torch.Tensor,
-        tour: torch.Tensor,
+        temperature: float = 0.1,
     ) -> torch.Tensor:
         """
-        Compute tour alignment loss.
-
-        Encourages cluster assignments to minimize edge cuts in the optimal tour.
-        Adjacent nodes in tour should preferably be in the same cluster.
+        Contrastive loss: nodes in same cluster should have similar embeddings.
 
         Args:
+            projections: L2-normalized projections (batch, n, d)
             assignments: Soft cluster assignments (batch, n, k)
-            tour: Optimal tour indices (batch, n) or adjacency (batch, n, n)
+            temperature: Temperature for contrastive loss
 
         Returns:
-            Tour alignment loss scalar
+            Loss scalar
         """
-        batch_size, n, k = assignments.shape
+        batch_size, n, d = projections.shape
 
-        if tour.dim() == 2:
-            # Convert tour sequence to adjacency
-            tour_adj = torch.zeros(batch_size, n, n, device=assignments.device)
-            for b in range(batch_size):
-                for i in range(n):
-                    j = (i + 1) % n
-                    tour_adj[b, tour[b, i], tour[b, j]] = 1
-                    tour_adj[b, tour[b, j], tour[b, i]] = 1
-        else:
-            tour_adj = tour
+        # Compute similarity matrix
+        sim_matrix = torch.bmm(projections, projections.transpose(1, 2))  # (batch, n, n)
+        sim_matrix = sim_matrix / temperature
 
         # Compute cluster membership similarity
         cluster_sim = torch.bmm(assignments, assignments.transpose(1, 2))  # (batch, n, n)
 
-        # Loss: edges in tour should have high cluster similarity
-        # (1 - cluster_sim) * tour_adj counts "cut" edges
-        cut_penalty = (1 - cluster_sim) * tour_adj
-        loss = cut_penalty.sum(dim=(1, 2)) / (tour_adj.sum(dim=(1, 2)) + 1e-8)
+        # Mask diagonal (don't compare node with itself)
+        mask = torch.eye(n, device=projections.device).unsqueeze(0)
+        sim_matrix = sim_matrix - mask * 1e9
 
+        # InfoNCE-style loss
+        exp_sim = torch.exp(sim_matrix)
+        positive_sim = (exp_sim * cluster_sim).sum(dim=-1)
+        total_sim = exp_sim.sum(dim=-1)
+
+        loss = -torch.log(positive_sim / (total_sim + 1e-8) + 1e-8)
         return loss.mean()
 
     def compute_loss(
         self,
-        h: torch.Tensor,
+        coords: torch.Tensor,
         tour: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
-        Compute all clustering losses.
+        Compute all losses.
 
         Args:
-            h: Node embeddings (batch, n, d)
-            tour: Optional optimal tour for tour alignment loss
+            coords: Node coordinates (batch, n, 2)
+            tour: Optional tour indices (batch, n) for tour alignment loss
 
         Returns:
-            Dictionary of loss components and total loss
+            Dictionary of losses
         """
-        output = self.forward(h)
+        output = self.forward(coords)
+        assignments = output['assignments']
+        projections = output['projections']
 
         losses = {}
 
-        # Contrastive loss
-        losses['contrastive'] = self.contrastive_loss(
-            output['projections'],
-            output['assignments'],
-        )
+        # Balance loss (always computed)
+        losses['balance'] = self.balance_loss(assignments)
 
-        # Balance loss
-        losses['balance'] = self.balance_loss(output['assignments'])
+        # Contrastive loss
+        losses['contrastive'] = self.contrastive_loss(projections, assignments)
 
         # Tour alignment loss (if tour provided)
         if tour is not None:
-            losses['tour_alignment'] = self.tour_alignment_loss(
-                output['assignments'],
-                tour,
-            )
+            losses['tour'] = self.tour_alignment_loss(assignments, tour)
         else:
-            losses['tour_alignment'] = torch.tensor(0.0, device=h.device)
+            losses['tour'] = torch.tensor(0.0, device=coords.device)
 
         # Total loss
         losses['total'] = (
-            losses['contrastive'] +
             self.lambda_balance * losses['balance'] +
-            self.lambda_tour * losses['tour_alignment']
+            self.lambda_contrastive * losses['contrastive'] +
+            self.lambda_tour * losses['tour']
         )
 
         return losses, output
 
-    def get_hard_assignments(self, h: torch.Tensor) -> torch.Tensor:
+    def predict_clusters(self, coords: torch.Tensor) -> torch.Tensor:
         """
-        Get hard cluster assignments.
+        Predict hard cluster assignments.
 
         Args:
-            h: Node embeddings (batch, n, d)
+            coords: Node coordinates (batch, n, 2) or (n, 2)
 
         Returns:
-            Hard cluster assignments (batch, n)
+            Cluster assignments (batch, n) or (n,)
         """
-        output = self.forward(h, hard=True)
-        return output['assignments'].argmax(dim=-1)
+        single = coords.dim() == 2
+        if single:
+            coords = coords.unsqueeze(0)
 
-    def get_cluster_nodes(
-        self,
-        assignments: torch.Tensor,
-    ) -> list:
+        with torch.no_grad():
+            output = self.forward(coords, hard=True)
+            assignments = output['assignments'].argmax(dim=-1)
+
+        if single:
+            assignments = assignments.squeeze(0)
+
+        return assignments
+
+    def get_cluster_nodes(self, assignments: torch.Tensor) -> List[List[int]]:
         """
         Get list of node indices for each cluster.
 
@@ -344,45 +359,69 @@ class DeepGraphClustering(nn.Module):
             clusters.append(nodes)
         return clusters
 
+    def compute_tour_edge_cuts(
+        self,
+        assignments: torch.Tensor,
+        tour: torch.Tensor,
+    ) -> int:
+        """
+        Count number of tour edges that cross cluster boundaries.
 
-class KMeansClusteringBaseline(nn.Module):
-    """
-    K-Means clustering baseline (non-learned).
+        Args:
+            assignments: Hard assignments (n,)
+            tour: Tour indices (n,)
 
-    Uses coordinate-based K-Means for comparison.
-    """
+        Returns:
+            Number of inter-cluster edges
+        """
+        n = len(tour)
+        cuts = 0
+        for i in range(n):
+            j = (i + 1) % n
+            node_i = tour[i].item()
+            node_j = tour[j].item()
+            if assignments[node_i] != assignments[node_j]:
+                cuts += 1
+        return cuts
 
-    def __init__(self, num_clusters: int = 10, num_iters: int = 10):
+
+class KMeansBaseline(nn.Module):
+    """K-Means clustering baseline for comparison."""
+
+    def __init__(self, num_clusters: int = 10, num_iters: int = 20):
         super().__init__()
         self.num_clusters = num_clusters
         self.num_iters = num_iters
 
-    def forward(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
+    @torch.no_grad()
+    def forward(self, coords: torch.Tensor) -> torch.Tensor:
         """
         Perform K-Means clustering on coordinates.
 
         Args:
-            x: Node coordinates (batch, n, 2)
+            coords: Node coordinates (batch, n, 2) or (n, 2)
 
         Returns:
-            Cluster assignments (batch, n)
+            Cluster assignments
         """
-        batch_size, n, d = x.shape
-        assignments = torch.zeros(batch_size, n, dtype=torch.long, device=x.device)
+        single = coords.dim() == 2
+        if single:
+            coords = coords.unsqueeze(0)
+
+        batch_size, n, d = coords.shape
+        device = coords.device
+        assignments = torch.zeros(batch_size, n, dtype=torch.long, device=device)
 
         for b in range(batch_size):
-            points = x[b]  # (n, d)
+            points = coords[b]
 
             # Initialize centroids randomly
-            indices = torch.randperm(n)[:self.num_clusters]
+            indices = torch.randperm(n, device=device)[:self.num_clusters]
             centroids = points[indices].clone()
 
             for _ in range(self.num_iters):
                 # Assign points to nearest centroid
-                dists = torch.cdist(points, centroids)  # (n, k)
+                dists = torch.cdist(points, centroids)
                 cluster_ids = dists.argmin(dim=1)
 
                 # Update centroids
@@ -391,6 +430,9 @@ class KMeansClusteringBaseline(nn.Module):
                     if mask.sum() > 0:
                         centroids[k] = points[mask].mean(dim=0)
 
-            assignments[b] = cluster_ids
+                assignments[b] = cluster_ids
+
+        if single:
+            assignments = assignments.squeeze(0)
 
         return assignments

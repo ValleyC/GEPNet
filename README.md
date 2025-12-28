@@ -1,109 +1,130 @@
-# DGC-TSP: Deep Graph Clustering for Hierarchical TSP
+# E²P: E(2)-Equivariant Partition for Large-Scale TSP
 
-This repository implements a novel approach combining Deep Graph Clustering (DGC) with hierarchical diffusion for solving large-scale Traveling Salesman Problems.
+This repository implements **E(2)-equivariant graph clustering** for partitioning large-scale TSP instances. The clustering is rotation and translation invariant by design, eliminating the need for data augmentation.
 
 ## Motivation
 
-Traditional divide-and-conquer approaches for large-scale TSP (like GLOP) use fixed partitioning strategies that may not align with the optimal tour structure. Our approach learns to partition the graph in a way that:
+Traditional divide-and-conquer approaches for large-scale TSP (like GLOP, UDC) use:
+- Fixed partitioning (sliding window) or
+- Standard GNN-based partitioning (requires data augmentation for rotation invariance)
 
-1. **Minimizes inter-cluster edges** in the optimal tour
-2. **Creates balanced clusters** for efficient parallel processing
-3. **Adapts to problem structure** rather than using geometric proximity alone
+Our approach uses **EGNN-based clustering** that:
+1. Is **E(2)-invariant** by design (no augmentation needed)
+2. **Minimizes inter-cluster tour edges** via tour-aware loss
+3. Creates **balanced clusters** for parallel processing
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                     DGC-TSP Pipeline                        │
+│           Stage 1: E(2)-Equivariant Clustering              │
 ├─────────────────────────────────────────────────────────────┤
 │                                                             │
-│  1. EGNN Encoder                                            │
-│     ├── Input: Node coordinates (n × 2)                     │
-│     ├── Process: E(n)-equivariant message passing           │
-│     └── Output: Node embeddings h ∈ R^(n × d)               │
+│  Input: Node coordinates (n × 2)                            │
+│              ↓                                              │
+│  ┌─────────────────────────┐                                │
+│  │   EGNN Encoder Layers   │  ← E(2)-equivariant            │
+│  │   (message passing)     │     message passing            │
+│  └───────────┬─────────────┘                                │
+│              ↓                                              │
+│  Node embeddings h ∈ R^(n × d)  ← E(2)-INVARIANT features   │
+│              ↓                                              │
+│  ┌─────────────────────────┐                                │
+│  │  Cluster Assignment MLP │  → Soft assignments (n × k)    │
+│  │  + Learnable Centroids  │                                │
+│  └───────────┬─────────────┘                                │
+│              ↓                                              │
+│  Output: Cluster labels     ← Invariant to rotation         │
 │                                                             │
-│  2. Learned Clustering Module                               │
-│     ├── Input: Node embeddings h                            │
-│     ├── Process: Soft cluster assignment via attention      │
-│     └── Output: Cluster assignments C ∈ R^(n × k)           │
-│                                                             │
-│  3. Hierarchical Diffusion                                  │
-│     ├── Level 1 (Coarse): Inter-cluster routing             │
-│     ├── Level 2 (Fine): Intra-cluster routing               │
-│     └── Cross-level message passing                         │
-│                                                             │
-│  4. Tour Assembly                                           │
-│     ├── Merge cluster solutions                             │
-│     └── Optional: 2-opt refinement                          │
-│                                                             │
+├─────────────────────────────────────────────────────────────┤
+│           Stage 2: Sub-problem Solving (Future)             │
+├─────────────────────────────────────────────────────────────┤
+│  • Solve each cluster with EDISCO/LKH                       │
+│  • Connect clusters optimally                               │
+│  • Optional: 2-opt refinement                               │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-## Key Components
+## Key Innovation
 
-### 1. Deep Graph Clustering (DGC)
+### E(2)-Invariant Clustering
 
-Unlike RGC which uses reinforcement learning to determine cluster count, our DGC:
-- Uses self-supervised contrastive learning
-- Learns cluster assignments that align with TSP tour structure
-- Provides differentiable soft assignments for end-to-end training
+Unlike existing methods that use standard GNN + data augmentation:
 
-### 2. Tour-Aware Clustering Loss
+| Method | Network | Augmentation | Tour-Aware |
+|--------|---------|--------------|------------|
+| GLOP | Attention | Required (8x) | No |
+| UDC | Standard GNN | Required | No |
+| **Ours** | **EGNN** | **Not needed** | **Yes** |
+
+### Tour-Aware Loss
 
 ```
-L_cluster = L_contrastive + λ₁ * L_tour_alignment + λ₂ * L_balance
+L = λ_balance * L_balance + λ_contrastive * L_contrastive + λ_tour * L_tour
 ```
 
-Where:
-- `L_contrastive`: InfoNCE loss for learning good representations
-- `L_tour_alignment`: Encourages clusters to minimize edge cuts in optimal tour
-- `L_balance`: Ensures balanced cluster sizes
-
-### 3. Hierarchical Diffusion
-
-Two-level diffusion process:
-- **Coarse level**: Learns inter-cluster connections
-- **Fine level**: Learns intra-cluster routing conditioned on coarse structure
+- `L_balance`: KL divergence from uniform cluster sizes
+- `L_contrastive`: Nodes in same cluster have similar embeddings
+- `L_tour`: Adjacent nodes in tour should be in same cluster
 
 ## Installation
 
 ```bash
-pip install torch torch-geometric numpy matplotlib
+pip install torch numpy scipy tqdm
 ```
 
 ## Usage
 
-### Training
+### Training Stage 1 (Clustering)
 
 ```bash
-# Generate training data
-python scripts/generate_data.py --num_samples 100000 --num_nodes 100 --output data/tsp100_train.txt
-
-# Train DGC-TSP model
-python train.py --data_path data/tsp100_train.txt --num_clusters 10 --epochs 100
+# Using existing EDISCO data format
+python train.py \
+    --data_path data/tsp100/tsp100_lkh_train.txt \
+    --val_data_path data/tsp100/tsp100_lkh_valid.txt \
+    --num_clusters 10 \
+    --epochs 100 \
+    --batch_size 32
 ```
 
-### Inference
+### Evaluation Metrics
 
-```bash
-python inference.py --checkpoint checkpoints/best_model.pt --data_path data/tsp100_test.txt
+The model is evaluated by counting **tour edge cuts** - the number of tour edges that cross cluster boundaries. Lower is better.
+
+```
+Val Tour Edge Cuts: EGNN=12.3, K-Means=18.7
 ```
 
-## Comparison with GLOP
+## File Structure
 
-| Aspect | GLOP | DGC-TSP |
-|--------|------|---------|
-| Partitioning | Fixed sliding window | Learned clustering |
-| Coordination | Sequential iteration | Hierarchical diffusion |
-| Equivariance | Data augmentation | Built-in E(n) |
-| Parallelization | Limited | High (clusters independent) |
+```
+DGC-TSP/
+├── dgc_tsp/
+│   ├── __init__.py
+│   ├── encoder.py      # EGNN encoder
+│   ├── clustering.py   # EGNNClusteringNetwork
+│   └── utils.py        # Dataset, utilities
+├── train.py            # Training script
+├── scripts/
+│   └── generate_data.py
+└── related_works/      # Reference papers
+```
+
+## Comparison with Related Work
+
+| Paper | Venue | Partition | Equivariant | Tour-Aware |
+|-------|-------|-----------|-------------|------------|
+| GLOP | AAAI 2024 | Sliding window | No | No |
+| UDC | NeurIPS 2024 | Learned GNN | No | No |
+| H-TSP | AAAI 2023 | RL selection | No | Implicit |
+| **Ours** | - | **Learned EGNN** | **Yes** | **Yes** |
 
 ## References
 
-- GLOP: Learning Global-Local Policies for Large-Scale TSP
-- EDISCO: Equivariant Diffusion for Combinatorial Optimization
-- RGC: Reinforcement Graph Clustering
-- Deep Graph Clustering (Liu et al., 2022, 2023)
+- [UDC: Unified Neural Divide-and-Conquer](https://arxiv.org/abs/2407.00312) (NeurIPS 2024)
+- [GLOP: Learning Global Partition and Local Construction](https://arxiv.org/abs/2312.08224) (AAAI 2024)
+- [H-TSP: Hierarchically Solving Large-Scale TSP](https://arxiv.org/abs/2304.09395) (AAAI 2023)
+- [EDISCO: Equivariant Diffusion for Combinatorial Optimization](https://github.com/ValleyC/EDISCO)
 
 ## License
 
