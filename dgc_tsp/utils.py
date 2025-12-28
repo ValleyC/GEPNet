@@ -250,36 +250,61 @@ def solve_tsp_lkh(coords: np.ndarray, runs: int = 1) -> Tuple[np.ndarray, float]
 class TSPDataset(torch.utils.data.Dataset):
     """
     Dataset for TSP instances.
+
+    Supports two formats:
+    1. EDISCO format: "x1 y1 x2 y2 ... output idx1 idx2 ..." (1-indexed tours)
+    2. Simple format: "x1 y1 x2 y2 ... idx1 idx2 ..." (0-indexed tours)
+
+    Auto-detects format based on presence of " output " delimiter.
     """
 
     def __init__(
         self,
         data_file: str,
         compute_adjacency: bool = True,
+        format: str = 'auto',
     ):
         """
         Args:
-            data_file: Path to data file (each line: x1 y1 x2 y2 ... tour_idx1 tour_idx2 ...)
+            data_file: Path to data file
             compute_adjacency: Whether to compute adjacency matrices
+            format: 'auto', 'edisco', or 'simple'
         """
         self.compute_adjacency = compute_adjacency
         self.instances = []
 
         with open(data_file, 'r') as f:
             for line in f:
-                parts = line.strip().split()
-                if not parts:
+                line = line.strip()
+                if not line:
                     continue
 
-                # Parse coordinates and tour
-                n = len(parts) // 3  # n coords (x,y) + n tour indices
-                coords = np.array([float(parts[i]) for i in range(2 * n)]).reshape(n, 2)
-                tour = np.array([int(parts[2 * n + i]) for i in range(n)])
+                # Auto-detect format based on first line
+                if format == 'auto':
+                    format = 'edisco' if ' output ' in line else 'simple'
+
+                if format == 'edisco' or ' output ' in line:
+                    # EDISCO format: "x1 y1 x2 y2 ... output idx1 idx2 ..."
+                    coords_str, tour_str = line.split(' output ')
+                    coords_parts = coords_str.strip().split()
+                    tour_parts = tour_str.strip().split()
+
+                    n = len(coords_parts) // 2
+                    coords = np.array([float(coords_parts[i]) for i in range(2 * n)]).reshape(n, 2)
+                    tour = np.array([int(t) - 1 for t in tour_parts])  # Convert to 0-indexed
+                else:
+                    # Simple format: "x1 y1 x2 y2 ... idx1 idx2 ..."
+                    parts = line.split()
+                    n = len(parts) // 3  # n coords (x,y) + n tour indices
+                    coords = np.array([float(parts[i]) for i in range(2 * n)]).reshape(n, 2)
+                    tour = np.array([int(parts[2 * n + i]) for i in range(n)])
 
                 self.instances.append({
                     'coords': coords.astype(np.float32),
                     'tour': tour,
                 })
+
+        print(f'Loaded "{data_file}" with {len(self.instances)} instances (format: {format})')
 
     def __len__(self) -> int:
         return len(self.instances)
