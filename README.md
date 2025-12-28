@@ -85,6 +85,18 @@ python train.py \
     --num_clusters 10 \
     --epochs 100 \
     --batch_size 32
+
+# Full training with matched hyperparameters (UDC-style)
+python train.py \
+    --data_path data/tsp500/tsp500_train.txt \
+    --val_data_path data/tsp500/tsp500_valid.txt \
+    --hidden_dim 64 \
+    --num_egnn_layers 8 \
+    --num_clusters 5 \
+    --epochs 500 \
+    --batch_size 1 \
+    --lr 1e-4 \
+    --lr_scheduler cosine
 ```
 
 ### Evaluation Metrics
@@ -112,12 +124,26 @@ DGC-TSP/
 
 ## Comparison with Related Work
 
+### Method Comparison
+
 | Paper | Venue | Partition | Equivariant | Tour-Aware |
 |-------|-------|-----------|-------------|------------|
 | GLOP | AAAI 2024 | Sliding window | No | No |
 | UDC | NeurIPS 2024 | Learned GNN | No | No |
 | H-TSP | AAAI 2023 | RL selection | No | Implicit |
 | **Ours** | - | **Learned EGNN** | **Yes** | **Yes** |
+
+### Model Architecture Comparison
+
+| Component | GLOP | UDC | Ours |
+|-----------|------|-----|------|
+| Hidden dim | 48 | 64 | 64 |
+| Num layers | 12 | 12 | 8 |
+| Architecture | Message Passing GNN | Message Passing GNN | EGNN |
+| Parameters | ~150K | ~200K | ~200K |
+| Equivariant | No (8x augmentation) | No (augmentation) | **Yes (built-in)** |
+
+Our EGNN layers are more computationally expensive (coordinate updates + attention), so we use fewer layers (8 vs 12) while matching parameter count.
 
 ## References
 

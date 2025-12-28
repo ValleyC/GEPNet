@@ -32,13 +32,16 @@ def parse_args():
     parser.add_argument('--val_data_path', type=str, default=None,
                         help='Path to validation data file')
 
-    # Model
-    parser.add_argument('--hidden_dim', type=int, default=128,
-                        help='Hidden dimension')
+    # Model (matched to GLOP/UDC specifications for fair comparison)
+    # GLOP: depth=12, units=48, ~150K params
+    # UDC: depth=12, embed_dim=64, ~200K params
+    # Ours: EGNN layers are more expensive, so we use depth=8, dim=64 for ~200K params
+    parser.add_argument('--hidden_dim', type=int, default=64,
+                        help='Hidden dimension (GLOP=48, UDC=64)')
     parser.add_argument('--num_clusters', type=int, default=10,
                         help='Number of clusters')
-    parser.add_argument('--num_egnn_layers', type=int, default=4,
-                        help='Number of EGNN layers')
+    parser.add_argument('--num_egnn_layers', type=int, default=8,
+                        help='Number of EGNN layers (GLOP=12, UDC=12, ours=8 due to heavier layers)')
     parser.add_argument('--temperature', type=float, default=0.5,
                         help='Temperature for cluster assignment')
 
@@ -50,19 +53,19 @@ def parse_args():
     parser.add_argument('--lambda_contrastive', type=float, default=0.1,
                         help='Weight for contrastive loss')
 
-    # Training
+    # Training (matched to UDC: lr=1e-4, epochs=500, batch=1 for large instances)
     parser.add_argument('--batch_size', type=int, default=32,
-                        help='Batch size')
-    parser.add_argument('--epochs', type=int, default=100,
-                        help='Number of epochs')
+                        help='Batch size (UDC uses 1 for large instances)')
+    parser.add_argument('--epochs', type=int, default=500,
+                        help='Number of epochs (UDC uses 500)')
     parser.add_argument('--lr', type=float, default=1e-4,
-                        help='Learning rate')
-    parser.add_argument('--weight_decay', type=float, default=1e-5,
-                        help='Weight decay')
+                        help='Learning rate (same as GLOP/UDC)')
+    parser.add_argument('--weight_decay', type=float, default=0,
+                        help='Weight decay (UDC uses 0)')
     parser.add_argument('--lr_scheduler', type=str, default='cosine',
                         choices=['none', 'cosine', 'step'],
                         help='Learning rate scheduler')
-    parser.add_argument('--warmup_epochs', type=int, default=5,
+    parser.add_argument('--warmup_epochs', type=int, default=10,
                         help='Warmup epochs')
 
     # Logging

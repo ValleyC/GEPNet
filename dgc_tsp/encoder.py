@@ -146,9 +146,9 @@ class EGNNEncoder(nn.Module):
     def __init__(
         self,
         input_dim: int = 2,
-        hidden_dim: int = 128,
-        output_dim: int = 128,
-        num_layers: int = 4,
+        hidden_dim: int = 64,  # Matched to competitors (GLOP=48, UDC=64)
+        output_dim: int = 64,
+        num_layers: int = 8,  # Fewer than GLOP/UDC (12) due to heavier EGNN layers
         attention: bool = True,
         residual: bool = True,
     ):

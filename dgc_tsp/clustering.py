@@ -30,8 +30,8 @@ class EGNNClusteringNetwork(nn.Module):
     def __init__(
         self,
         num_clusters: int = 10,
-        hidden_dim: int = 128,
-        num_egnn_layers: int = 4,
+        hidden_dim: int = 64,  # Matched to UDC (GLOP=48, UDC=64)
+        num_egnn_layers: int = 8,  # Fewer than GLOP/UDC (12) due to heavier EGNN layers
         temperature: float = 0.5,
         lambda_balance: float = 0.1,
         lambda_tour: float = 1.0,
