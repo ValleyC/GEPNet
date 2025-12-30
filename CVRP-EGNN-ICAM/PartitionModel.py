@@ -7,7 +7,8 @@ Key innovations:
 1. EGNN backbone produces invariant embeddings
 2. No coordinate_transformation needed
 3. State-aware partition considers depot, first, last, visited nodes
-4. Node features: (demand, r, theta) - polar coords relative to depot
+4. Node features: (demand, r) - E(2)-invariant features only
+   NOTE: theta (polar angle) is NOT used - it breaks equivariance!
 """
 
 import torch
@@ -111,11 +112,11 @@ class EGNN(nn.Module):
     """
     E(2)-Equivariant GNN backbone for CVRP partition.
 
-    Input node features: (demand, r, theta) - polar coords relative to depot
-    These are already E(2)-invariant!
+    Input node features: (demand, r) - E(2)-invariant features
+    NOTE: theta is NOT used as it breaks equivariance under rotation!
     """
 
-    def __init__(self, depth=12, node_feats=3, edge_feats=2, units=48):
+    def __init__(self, depth=12, node_feats=2, edge_feats=2, units=48):
         super().__init__()
         self.depth = depth
         self.units = units
@@ -130,7 +131,7 @@ class EGNN(nn.Module):
     def forward(self, x, edge_index, edge_attr, coords):
         """
         Args:
-            x: Node features (n_nodes, node_feats) - (demand, r, theta)
+            x: Node features (n_nodes, node_feats) - (demand, r)
             edge_index: (2, n_edges)
             edge_attr: Edge features (n_edges, edge_feats)
             coords: Node coordinates (n_nodes, 2) for EGNN updates
@@ -285,7 +286,7 @@ class PartitionModel(nn.Module):
         """
         Args:
             units: Hidden dimension
-            feats: Node feature dim (3 for CVRP: demand, r, theta)
+            feats: Node feature dim (2 for CVRP: demand, r) - NO theta!
             k_sparse: Number of sparse neighbors
             edge_feats: Edge feature dim
             depth: Number of GNN layers

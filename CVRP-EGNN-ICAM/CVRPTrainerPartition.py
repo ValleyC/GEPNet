@@ -58,7 +58,7 @@ class CVRPPartitionTrainer:
         # Models
         self.model_p = PartitionModel(
             units=model_p_params['embedding_dim'],
-            feats=3,  # (demand, r, theta)
+            feats=2,  # (demand, r) - NO theta for E(2)-equivariance!
             k_sparse=100,
             edge_feats=2,
             depth=model_p_params['depth'],
@@ -405,10 +405,11 @@ class CVRPPartitionTrainer:
         """
         Generate PyG data with E(2)-invariant features.
 
-        Node features: (demand, r, theta) - polar coordinates relative to depot
+        Node features: (demand, r) - demand and distance from depot
         Edge features: (cosine_similarity, distance)
 
-        These are inherently E(2)-invariant!
+        Note: theta (polar angle) is NOT used because it breaks E(2)-equivariance!
+        Under rotation, theta changes, which would produce different outputs.
         """
         bs = demand.size(0)
         n_nodes = demand.size(1)
@@ -418,12 +419,12 @@ class CVRPPartitionTrainer:
         shift_coors = coors - coors[:, 0:1, :]
         _x, _y = shift_coors[:, :, 0], shift_coors[:, :, 1]
 
-        # Polar coordinates (E(2)-invariant features!)
+        # Distance from depot (E(2)-invariant!)
         r = torch.sqrt(_x ** 2 + _y ** 2)
-        theta = torch.atan2(_y, _x)
+        # NOTE: theta = torch.atan2(_y, _x) is NOT used - breaks equivariance!
 
-        # Node features: (demand, r, theta)
-        x = torch.stack((norm_demand, r, theta)).permute(1, 2, 0)
+        # Node features: (demand, r) - both are E(2)-invariant
+        x = torch.stack((norm_demand, r)).permute(1, 2, 0)
 
         # Cosine similarity matrix
         cos_mat = self.gen_cos_sim_matrix(shift_coors)

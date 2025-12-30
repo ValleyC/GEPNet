@@ -7,7 +7,9 @@ Key differences from CVRP:
 - No depot node (all nodes are equal)
 - No capacity constraints
 - State query: first + last + visited (no depot)
-- Node features: (x, y) -> EGNN produces invariant embeddings
+- Node features: Constant ones (E(2)-invariant)
+  NOTE: Raw (x, y) coordinates are NOT used as features - they break equivariance!
+  Coordinates are passed separately for EGNN distance computation.
 """
 
 import torch
@@ -87,10 +89,14 @@ class EGNN(nn.Module):
     """
     E(2)-Equivariant GNN backbone for TSP partition.
 
-    For TSP, we use coordinate-derived invariant features.
+    Node features: Constant ones (E(2)-invariant)
+    Edge features: Negative distances (E(2)-invariant)
+    Coordinates: Used for EGNN message passing (distances are invariant)
+
+    NOTE: Raw (x, y) are NOT used as node features - they break equivariance!
     """
 
-    def __init__(self, depth=12, node_feats=2, edge_feats=2, units=48):
+    def __init__(self, depth=12, node_feats=1, edge_feats=2, units=48):
         super().__init__()
         self.depth = depth
         self.units = units

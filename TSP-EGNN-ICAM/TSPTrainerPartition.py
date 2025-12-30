@@ -57,7 +57,7 @@ class TSPTrainerPartition:
         # Models
         self.model_p = PartitionModel(
             units=model_p_params['embedding_dim'],
-            feats=2,  # (x, y) coordinates
+            feats=1,  # Constant feature (1) - E(2)-invariant! Coordinates passed separately.
             k_sparse=100,
             edge_feats=2,
             depth=model_p_params['depth'],
@@ -317,9 +317,14 @@ class TSPTrainerPartition:
 
     def _gen_pyg_data(self, coors, k_sparse=100):
         """
-        Generate PyG data with invariant features.
+        Generate PyG data with E(2)-invariant features.
 
-        For TSP: Use negative distances as edge features (invariant).
+        Node features: Constant ones (E(2)-invariant)
+        Edge features: Negative distances (E(2)-invariant)
+        Coordinates: Passed separately for EGNN distance computation
+
+        Note: Raw (x, y) coordinates are NOT used as node features because
+        they change under rotation, breaking E(2)-equivariance.
         """
         bs = coors.size(0)
         n_nodes = coors.size(1)
@@ -339,13 +344,14 @@ class TSPTrainerPartition:
         edge_attr2 = cos_mat[idx.view(bs, -1), edge_index[:, 0], edge_index[:, 1]].reshape(bs, k_sparse * n_nodes, 1)
         edge_attr = torch.cat([edge_attr1, edge_attr2], dim=2)
 
-        # Node features: coordinates (EGNN will make them invariant)
-        x = coors[0]
+        # Node features: constant ones (E(2)-invariant!)
+        # All nodes are indistinguishable by features; EGNN learns from graph structure.
+        x = torch.ones(n_nodes, 1, device=coors.device)
 
         pyg_data = Data(
             x=x,
             edge_index=edge_index[0],
             edge_attr=edge_attr[0],
-            pos=x  # EGNN needs coordinates
+            pos=coors[0]  # Coordinates for EGNN distance computation (NOT as features)
         )
         return pyg_data
