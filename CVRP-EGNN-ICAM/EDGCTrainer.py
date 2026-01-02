@@ -15,6 +15,7 @@ from logging import getLogger
 from torch_geometric.data import Data
 from torch.optim import Adam as Optimizer
 from torch.optim.lr_scheduler import MultiStepLR as Scheduler
+from torch.distributions import Categorical
 
 import sys
 import os
@@ -231,31 +232,46 @@ class EDGCTrainer:
             sigma=0.01
         )
 
-        # Get hard cluster assignments (for solver)
-        # Use sampling for exploration
-        labels, log_probs_cluster = self.model_p.get_hard_assignment(q[1:], sample=True)  # Exclude depot
+        # Get hard cluster assignments (for solver) - use multiple samples for POMO-like exploration
+        # Sample multiple times and keep the best
+        sample_size = self.env.sample_size
+        all_labels = []
+        all_log_probs = []
 
-        # Compute cluster statistics
+        for _ in range(sample_size):
+            labels, log_probs = self.model_p.get_hard_assignment(q[1:], sample=True)
+            all_labels.append(labels)
+            all_log_probs.append(log_probs)
+
+        all_labels = torch.stack(all_labels, dim=0)  # (sample_size, n_nodes)
+        all_log_probs = torch.stack(all_log_probs, dim=0)  # (sample_size, n_nodes)
+
+        # Compute cluster statistics (using first sample)
         stats = compute_cluster_statistics(q[1:], demands)
 
-        # Convert clusters to routes
-        routes = self._cluster_to_routes(labels, self.env.raw_depot_node_xy[0], demands)
+        # Convert each sampled clustering to solution and solve
+        solution, solution_flag = self._clusters_to_solution(all_labels, demands)
 
-        # Solve sub-problems (TSP for each route)
-        total_reward, loss_t = self._solve_routes(routes)
+        # Solve sub-problems using the conquering stage
+        merge_reward, loss_t = self._solve_with_conquering(solution, solution_flag, batch_size)
 
-        # Compute EDGC loss
+        # REINFORCE for partition
+        log_probs_sum = all_log_probs.sum(dim=1)  # (sample_size,)
+        advantage = merge_reward - merge_reward.mean()
+        loss_partition = -(advantage.detach() * log_probs_sum).mean()
+
+        # Compute EDGC clustering losses
         total_loss, loss_dict = self.edgc_loss(
-            z1[1:], z2[1:], q[1:],  # Exclude depot
+            z1[1:], z2[1:], q[1:],
             demands=demands,
             capacity=1.0,
-            log_probs=log_probs_cluster.sum().unsqueeze(0),  # Sum log probs for REINFORCE
-            rewards=total_reward.unsqueeze(0),
+            log_probs=None,  # Already handled above
+            rewards=None,
             baseline=None
         )
 
-        # Add solver loss
-        total_loss = total_loss + loss_t
+        # Combine losses
+        total_loss = total_loss + loss_partition + loss_t
 
         # Backward pass
         self.model_p.zero_grad()
@@ -264,108 +280,231 @@ class EDGCTrainer:
         self.optimizer_p.step()
         self.optimizer_t.step()
 
-        score = -total_reward.item()
+        max_reward = merge_reward.max()
+        score = -max_reward.item()
         return score, total_loss.item(), stats
 
-    def _cluster_to_routes(self, labels, coords, demands, capacity=1.0):
+    def _clusters_to_solution(self, all_labels, demands, capacity=1.0):
         """
-        Convert cluster labels to CVRP routes.
+        Convert cluster labels to solution format compatible with conquering stage.
 
         Args:
-            labels: Cluster assignments (n_nodes,) - excludes depot
-            coords: Node coordinates (n_nodes+1, 2) - includes depot
-            demands: Node demands (n_nodes,) - excludes depot
-            capacity: Vehicle capacity
+            all_labels: (sample_size, n_nodes) cluster assignments
+            demands: (n_nodes,) node demands
+            capacity: vehicle capacity
 
         Returns:
-            routes: List of routes, each is list of node indices (1-indexed)
+            solution: (sample_size, n_nodes) node visit order
+            solution_flag: (sample_size, n_nodes) route end markers
         """
-        device = labels.device
-        unique_clusters = torch.unique(labels)
-        routes = []
+        sample_size = all_labels.shape[0]
+        n_nodes = all_labels.shape[1]
+        device = all_labels.device
+
+        solution = torch.zeros((sample_size, n_nodes), dtype=torch.long, device=device)
+        solution_flag = torch.zeros((sample_size, n_nodes), dtype=torch.long, device=device)
+
+        coords = self.env.raw_depot_node_xy[0]  # (n_nodes+1, 2)
         depot_coord = coords[0]
 
-        for cluster_id in unique_clusters:
-            mask = labels == cluster_id
-            cluster_nodes = torch.where(mask)[0] + 1  # +1 for depot offset
-            cluster_demands = demands[mask]
+        for s in range(sample_size):
+            labels = all_labels[s]
+            unique_clusters = torch.unique(labels)
 
-            # Sort by angle from depot
-            cluster_coords = coords[cluster_nodes]
-            rel_coords = cluster_coords - depot_coord
-            angles = torch.atan2(rel_coords[:, 1], rel_coords[:, 0])
-            sorted_indices = torch.argsort(angles)
+            current_pos = 0
+            for cluster_id in unique_clusters:
+                mask = labels == cluster_id
+                cluster_nodes = torch.where(mask)[0] + 1  # +1 for depot offset (1-indexed)
+                cluster_demands = demands[mask]
 
-            # Split into routes based on capacity
-            current_route = []
-            current_demand = 0.0
+                # Sort by angle from depot
+                cluster_coords = coords[cluster_nodes]
+                rel_coords = cluster_coords - depot_coord
+                angles = torch.atan2(rel_coords[:, 1], rel_coords[:, 0])
+                sorted_indices = torch.argsort(angles)
 
-            for idx in sorted_indices:
-                node = cluster_nodes[idx].item()
-                demand = cluster_demands[idx].item()
+                # Split into routes based on capacity
+                current_demand = 0.0
+                route_start = current_pos
 
-                if current_demand + demand > capacity + 1e-6:
-                    if current_route:
-                        routes.append(current_route)
-                    current_route = [node]
-                    current_demand = demand
-                else:
-                    current_route.append(node)
-                    current_demand += demand
+                for idx in sorted_indices:
+                    node = cluster_nodes[idx]
+                    demand = cluster_demands[idx].item()
 
-            if current_route:
-                routes.append(current_route)
+                    if current_demand + demand > capacity + 1e-6:
+                        # Mark end of route
+                        if current_pos > route_start:
+                            solution_flag[s, current_pos - 1] = 1
+                        route_start = current_pos
+                        current_demand = demand
+                    else:
+                        current_demand += demand
 
-        return routes
+                    solution[s, current_pos] = node
+                    current_pos += 1
 
-    def _solve_routes(self, routes):
+                # Mark end of cluster's last route
+                if current_pos > route_start:
+                    solution_flag[s, current_pos - 1] = 1
+
+        # Final flag
+        solution_flag[:, -1] = 1
+
+        return solution, solution_flag
+
+    def _solve_with_conquering(self, solution, solution_flag, batch_size):
         """
-        Solve TSP for each route and return total reward.
+        Apply conquering stage (DCR) to optimize sub-problems.
 
-        Args:
-            routes: List of routes
-
-        Returns:
-            total_reward: Negative total tour length
-            loss_t: Solver training loss
+        Similar to original CVRPTrainerPartition but adapted for clustering output.
         """
-        total_length = 0.0
-        loss_t_total = 0.0
+        loss_t_total = torch.tensor(0.0, device=self.device)
 
-        for route in routes:
-            if len(route) <= 1:
-                # Single node or empty route
-                if len(route) == 1:
-                    # Just depot -> node -> depot distance
-                    node_idx = route[0]
-                    depot = self.env.raw_depot_node_xy[0, 0]
-                    node = self.env.raw_depot_node_xy[0, node_idx]
-                    dist = torch.norm(node - depot) * 2
-                    total_length += dist.item()
-                continue
+        # Route ranking by angle
+        solution, solution_flag = self.route_ranking(
+            self.env.raw_depot_node_xy, solution, solution_flag
+        )
 
-            # Create sub-problem
-            route_tensor = torch.tensor(route, device=self.device)
-            tsp_coords = self.env.raw_depot_node_xy[0, route_tensor]
-            depot = self.env.raw_depot_node_xy[0, 0:1]
+        # Reshape into sub-problems of size problem_size
+        n_tsps_per_route = solution.view(solution.size(0), -1, self.env.problem_size)
+        n_tsps_per_route_flag = solution_flag.view(solution.size(0), -1, self.env.problem_size)
 
-            # Compute tour length using nearest neighbor heuristic
-            # (For simplicity; in full implementation, use model_t)
-            tour_length = self._compute_tour_length(depot, tsp_coords)
-            total_length += tour_length
+        # Get demands for each sub-problem
+        demand_per_route = self.env.raw_depot_node_demand[:, None, :].repeat(
+            solution.size(0), n_tsps_per_route.size(1), 1
+        ).gather(-1, n_tsps_per_route)
 
-        total_reward = -torch.tensor(total_length, device=self.device)
-        return total_reward, torch.tensor(loss_t_total, device=self.device)
+        # Capacity calculation
+        capacity_now = torch.ones((demand_per_route.size(0), demand_per_route.size(1)), device=self.device)
+        tag = (n_tsps_per_route_flag * (n_tsps_per_route.size(-1) - torch.arange(n_tsps_per_route.size(-1), device=self.device))).max(-1)[1].unsqueeze(-1)
+        capacity_now -= torch.cumsum(demand_per_route, dim=-1).gather(-1, tag).squeeze()
 
-    def _compute_tour_length(self, depot, nodes):
-        """Compute simple tour length: depot -> nodes in order -> depot."""
-        if nodes.shape[0] == 0:
-            return 0.0
+        capacity_end = torch.ones((demand_per_route.size(0), demand_per_route.size(1)), device=self.device)
+        tag = (n_tsps_per_route_flag * torch.arange(n_tsps_per_route.size(-1), device=self.device)).max(-1)[1].unsqueeze(-1)
+        capacity_end -= torch.cumsum(demand_per_route, dim=-1)[:, :, -1] - torch.cumsum(demand_per_route, dim=-1).gather(-1, tag).squeeze()
 
-        coords = torch.cat([depot, nodes, depot], dim=0)
-        diffs = coords[1:] - coords[:-1]
-        lengths = torch.norm(diffs, dim=-1)
-        return lengths.sum().item()
+        # Create TSP instances
+        tsp_insts = self.env.raw_problems[:, None, :].repeat(
+            solution.size(0), n_tsps_per_route.size(1), 1, 1
+        ).gather(-2, n_tsps_per_route.unsqueeze(-1).expand(-1, -1, -1, 3))
+        customer_insts_now = tsp_insts.view(-1, tsp_insts.size(-2), tsp_insts.size(-1))
+
+        # Add depot
+        tsp_insts_now = torch.cat((
+            self.env.raw_problems[:, 0, :].unsqueeze(0).repeat(customer_insts_now.size(0), 1, 1),
+            customer_insts_now
+        ), dim=1)
+
+        # Initial solution
+        solution_now = torch.arange(1, tsp_insts_now.size(-2), device=self.device)[None, :].expand((tsp_insts_now.size(0), -1))[:, None, :]
+        reward_now = self.env.cal_open_length(
+            tsp_insts_now[:, :, [0, 1]],
+            solution_now,
+            n_tsps_per_route_flag.view(-1, tsp_insts_now.size(-2) - 1)[:, None, :]
+        )
+
+        # Capacity pairing
+        capacity_pair2 = capacity_end.clone().view(-1, 1)
+        capacity_pair1 = capacity_now.clone().roll(dims=1, shifts=-1).view(-1, 1)
+        capacity_pair = torch.cat((capacity_pair1, capacity_pair2), dim=-1)
+        capacity_pair[:, 0][(capacity_pair[:, 1] == 1.)] = 0.
+        tag = ((capacity_pair[:, 1] > 0.5) & (capacity_pair[:, 0] > 0.5)).clone()
+        capacity_pair[:, 1][tag] = 0.5
+        capacity_pair[:, 0][tag] = 0.5
+        capacity_pair[:, 0][(capacity_pair[:, 0] > 0.5) & (capacity_pair[:, 1] <= 0.5)] = 1 - capacity_pair[:, 1][(capacity_pair[:, 0] > 0.5) & (capacity_pair[:, 1] <= 0.5)]
+        capacity_pair[:, 1][(capacity_pair[:, 1] > 0.5) & (capacity_pair[:, 0] <= 0.5)] = 1 - capacity_pair[:, 0][(capacity_pair[:, 1] > 0.5) & (capacity_pair[:, 0] <= 0.5)]
+
+        capacity_head = capacity_pair[:, 1].clone().view(self.env.sample_size, -1).roll(dims=1, shifts=1).view(-1, 1)
+        capacity_tail = capacity_pair[:, 0].clone().view(-1, 1)
+        new_batch_size = tsp_insts_now.size(0)
+
+        # Load sub-problems
+        self.env.load_problems(
+            new_batch_size,
+            tsp_insts_now[:, 0:1, :2],
+            tsp_insts_now[:, 1:, :2],
+            tsp_insts_now[:, 1:, -1],
+            n_tsps_per_route_flag[:, :, -1].clone().view(-1)
+        )
+        reset_state, _, _ = self.env.reset(capacity_head, capacity_tail)
+        self.model_t.pre_forward(reset_state)
+
+        # POMO rollout
+        prob_list = torch.zeros(size=(new_batch_size, self.env.pomo_size, 0), device=self.device)
+        state, reward, done = self.env.pre_step()
+
+        while not done:
+            cur_dist = self.env.get_local_feature()
+            selected_t, prob = self.model_t(state, cur_dist, n_tsps_per_route_flag[:, :, -1].clone().view(-1))
+            state, reward, done = self.env.step(selected_t)
+            prob_list = torch.cat((prob_list, prob[:, :, None]), dim=2)
+
+        new_solution = torch.cat((state.solution_list.unsqueeze(-1), state.solution_flag.unsqueeze(-1)), dim=-1)
+        reward = -1 * self.env.cal_length(tsp_insts_now[:, :, [0, 1]], new_solution[:, :, :, 0], new_solution[:, :, :, 1])
+
+        # Sub-solver loss
+        advantage = reward - reward.float().mean(dim=1, keepdims=True)
+        loss = (-advantage * prob_list.log().sum(dim=2)).mean()
+        loss_t_total = loss_t_total + loss
+
+        # Update solution with best POMO results
+        reward_eval = self.env.cal_length(tsp_insts_now[:, :, [0, 1]], new_solution[:, :, :, 0], new_solution[:, :, :, 1])
+        tag = reward_eval.view(batch_size, self.env.sample_size, -1, self.env.pomo_size).min(-1)[1][..., None, None].expand(-1, -1, -1, -1, self.env.problem_size)
+        tag_solution = state.solution_list.view(batch_size, self.env.sample_size, -1, self.env.pomo_size, self.env.problem_size).gather(-2, tag).squeeze()
+        tag_solution_flag = state.solution_flag.view(batch_size, self.env.sample_size, -1, self.env.pomo_size, self.env.problem_size).gather(-2, tag).squeeze()
+
+        r = (reward_eval.min(1)[0] > reward_now.squeeze()).view(self.env.sample_size, -1, 1).expand((-1, -1, tsp_insts_now.size(-2) - 1))
+        tag_solution[r] = solution_now.view(self.env.sample_size, -1, tsp_insts_now.size(-2) - 1)[r]
+        tag_solution_flag[r] = n_tsps_per_route_flag[r]
+
+        solution = n_tsps_per_route.gather(-1, tag_solution - 1).view(solution.size(0), -1)
+        solution_flag = tag_solution_flag.view(solution.size(0), -1)
+
+        # Compute final reward
+        merge_reward = -1 * self.env.cal_length_total(
+            self.env.raw_problems[:, :, [0, 1]], solution, solution_flag
+        ).squeeze(0)
+
+        return merge_reward, loss_t_total
+
+    def route_ranking(self, problem, solution, solution_flag):
+        """Rank routes by angle for better partitioning."""
+        roll = ((solution_flag * torch.arange(solution.size(-1), device=solution.device)[None, :]).max(-1)[1] + 1) % solution.size(-1)
+        roll_init = solution.size(-1) - roll[:, None]
+        roll_diff = (torch.arange(solution.size(-1), device=solution.device)[None, :].expand_as(solution) + roll[:, None]) % solution.size(-1)
+        now_solution = solution.gather(1, roll_diff)
+        now_solution_flag = solution_flag.gather(1, roll_diff)
+        solution = now_solution.clone()
+        solution_flag = now_solution_flag.clone()
+
+        vector = problem - problem[:, 0, :][:, None, :]
+        vector_rank = vector.repeat(solution.size(0), 1, 1).gather(1, solution.unsqueeze(-1).expand(-1, -1, 2))
+        solution_start = torch.cummax(solution_flag.roll(dims=1, shifts=1) * torch.arange(solution.size(-1), device=solution.device)[None, :], dim=-1)[0]
+        solution_end = solution.size(-1) - 1 - torch.flip(torch.cummax(torch.flip(solution_flag, dims=[1]) * torch.arange(solution.size(-1), device=solution.device)[None, :], dim=-1)[0], dims=[1])
+        num_vector2 = solution_end - solution_start + 1
+
+        cum_vr = torch.cumsum(vector_rank.clone(), dim=1)
+        sum_vector2 = cum_vr.clone().gather(1, solution_end.unsqueeze(-1).expand_as(vector_rank)) - \
+                      cum_vr.clone().gather(1, solution_start.unsqueeze(-1).expand_as(vector_rank)) + \
+                      vector_rank.clone().gather(1, solution_start.unsqueeze(-1).expand_as(vector_rank))
+
+        vector_angle = torch.atan2(sum_vector2[:, :, 1] / num_vector2, sum_vector2[:, :, 0] / num_vector2)
+        total_indi = vector_angle
+        total_rank = np.argsort(total_indi.cpu().numpy(), kind='stable')
+        total_rank = torch.from_numpy(total_rank).to(solution.device)
+
+        roll = total_rank.min(-1)[1]
+        roll_diff = (torch.arange(solution.size(-1), device=solution.device)[None, :].expand_as(solution) + roll[:, None]) % solution.size(-1)
+        now_rank = total_rank.gather(1, roll_diff)
+
+        solution_rank = solution.gather(1, now_rank)
+        solution_flag_rank = solution_flag.gather(1, now_rank)
+
+        roll_diff = (torch.arange(solution.size(-1), device=solution.device)[None, :].expand_as(solution) + roll_init) % solution.size(-1)
+        solution_rank = solution_rank.gather(1, roll_diff)
+        solution_flag_rank = solution_flag_rank.gather(1, roll_diff)
+
+        return solution_rank, solution_flag_rank
 
     def gen_pyg_data(self, coors, demand, k_sparse=100):
         """Generate PyG data with E(2)-invariant features."""
